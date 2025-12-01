@@ -322,6 +322,13 @@ def call_llm(batch):
     # --- пробуем распарсить батч целиком ---
     try:
         arr = safe_parse_json(raw_content)
+
+        # LLM иногда отвечает одним объектом вместо массива — унифицируем в список
+        if isinstance(arr, dict):
+            arr = [arr]
+
+        if not isinstance(arr, list):
+            raise ValueError(f"unexpected JSON type: {type(arr)}")
     except Exception as e:
         print("[JSON ERROR] batch-level error:", e)
         print("[JSON ERROR] falling back to per-item evaluation…")
