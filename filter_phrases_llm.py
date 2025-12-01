@@ -85,21 +85,29 @@ def simple_prefilter(rec: dict) -> bool:
     """
     Детерминированная фильтрация до LLM.
     True = отправлять в LLM, False = выкидывать сразу.
-    В начале удаляем emoji и другие символы вне BMP.
+    В начале удаляем управляющие символы и emoji.
     """
-    # удалить emoji (все символы за пределами U+0000..U+FFFF)
-    phrase = re.sub(r"[\U00010000-\U0010ffff]", "", rec["phrase"])
-    phrase = phrase.strip()
+    raw = rec["phrase"]
+
+    # 1) убрать управляющие символы (NUL и пр.)
+    #    U+0000–U+001F и U+007F
+    phrase = re.sub(r"[\u0000-\u001F\u007F]", " ", raw)
+
+    # 2) убрать emoji и прочие не-BMP символы
+    phrase = re.sub(r"[\U00010000-\U0010ffff]", "", phrase)
+
+    # 3) нормализовать пробелы
+    phrase = re.sub(r"\s+", " ", phrase).strip()
     if not phrase:
         return False
 
-    # записываем очищенную фразу обратно в запись
+    # записываем очищенную фразу обратно
     rec["phrase"] = phrase
 
     tokens = phrase.split()
     n_eff = len(tokens)
 
-    # базовая длина по словам
+    # базовая длина по словам — уже по очищенному тексту
     if n_eff < 2 or n_eff > 5:
         return False
 
@@ -144,11 +152,34 @@ def simple_prefilter(rec: dict) -> bool:
         "tengo", "tienes", "tiene", "tenemos",
         "puedo", "puedes", "puede", "podemos",
         "vamos", "voy", "ven", "venga",
-        "dime", "ди", "haz", "ve",
+        "dime", "di", "haz", "ve",
         "mira", "pienso", "creo", "sabes", "sabe",
         "habla", "hablo", "hable", "hablemos",
         "déjame", "déjate",
     }
+
+    def has_common_verb() -> bool:
+        for t in lower_tokens:
+            if t.strip("¡!¿?.,;:()[]{}\"'«»") in common_verbs:
+                return True
+        return False
+
+    if phrase.startswith(("¡", "¿")) and not has_common_verb():
+        return False
+
+    # 8. Проверка "похожести на испанский"
+    es_like_count = 0
+    es_total = 0
+    for t in tokens:
+        if any(c.isalpha() for c in t):
+            es_total += 1
+            if _es_like(t):
+                es_like_count += 1
+    if es_total > 0 and es_like_count / es_total < 0.5:
+        return False
+
+    return True
+
 
     def has_common_verb() -> bool:
         for t in lower_tokens:
