@@ -1,30 +1,28 @@
 #!/usr/bin/env python
-import json, re, os, time, requests
+import json
+import re
+import time
 from pathlib import Path
+
+import requests
 from tqdm import tqdm
 
 # ==========================
 #   ПУТИ
 # ==========================
 
-# вход — результат префильтра (на sda2)
-PHRASE_INDEX = Path(
-    "/media/ol/SSD2T_Photo/hablai/corpus/jsonl/phrase_index_prefiltered.jsonl"
-)
+# исходный индекс (на NVMe)
+PHRASE_INDEX = Path("corpus/jsonl/phrase_index.jsonl")
 
-# итоговый индекс (на sda2)
-OUTPUT_INDEX = Path(
-    "/media/ol/SSD2T_Photo/hablai/corpus/jsonl/phrase_index_llm_filtered.jsonl"
-)
-
-# чекпоинт — номер строки во входном PHRASE_INDEX
+# результат и чекпоинт — на sda2
+OUTPUT_INDEX = Path("/media/ol/SSD2T_Photo/hablai/corpus/jsonl/phrase_index_llm_filtered.jsonl")
 CHECKPOINT = Path("/media/ol/SSD2T_Photo/hablai/llm_filter_checkpoint.json")
 
 # ==========================
 #   ПАРАМЕТРЫ
 # ==========================
 
-BATCH_SIZE = 16  # сколько фраз отправляем в LLM за один запрос
+BATCH_SIZE = 32  # сколько фраз отправляем в LLM за один запрос
 
 # Настройки LLM (OpenAI-совместимый API)
 BASE_URL = "http://localhost:8000/v1"
@@ -40,7 +38,7 @@ SESSION = requests.Session()
 
 def load_checkpoint() -> int:
     """
-    Вернуть номер последней обработанной строки входного jsonl.
+    Вернуть номер последней обработанной строки исходного phrase_index.jsonl.
     -1, если чекпоинта нет или он битый.
     """
     if CHECKPOINT.exists():
@@ -62,6 +60,152 @@ def save_checkpoint(last_line: int) -> None:
 
 
 # ==========================
+#   ПРЕФИЛЬТР ДО LLM
+# ==========================
+
+# базовый алфавит для "похожести на испанский"
+_ES_LETTERS = set("abcdefghijklmnñopqrstuvwxyzáéíóúü")
+
+
+def _es_like(word: str) -> bool:
+    """
+    Грубая проверка: слово похоже на испанское?
+    Разрешаем буквы испанского алфавита + апостроф.
+    """
+    w = word.lower().strip("¡!¿?.,;:()[]{}\"'«»")
+    if not w:
+        return False
+    letters = [c for c in w if c.isalpha()]
+    if not letters:
+        return False
+    return all(c in _ES_LETTERS for c in letters)
+
+
+def simple_prefilter(rec: dict) -> bool:
+    """
+    Детерминированная фильтрация до LLM.
+    True = отправлять в LLM, False = выкидывать сразу.
+    В начале удаляем управляющие символы и emoji.
+    """
+    raw = rec["phrase"]
+
+    # 1) убрать управляющие символы (NUL и пр.)
+    #    U+0000–U+001F и U+007F
+    phrase = re.sub(r"[\u0000-\u001F\u007F]", " ", raw)
+
+    # 2) убрать emoji и прочие не-BMP символы
+    phrase = re.sub(r"[\U00010000-\U0010ffff]", "", phrase)
+
+    # 3) нормализовать пробелы
+    phrase = re.sub(r"\s+", " ", phrase).strip()
+    if not phrase:
+        return False
+
+    # записываем очищенную фразу обратно
+    rec["phrase"] = phrase
+
+    tokens = phrase.split()
+    n_eff = len(tokens)
+
+    # базовая длина по словам — уже по очищенному тексту
+    if n_eff < 2 or n_eff > 5:
+        return False
+
+    lower_tokens = [t.lower() for t in tokens]
+
+    # 1. URL, почта, домены
+    if "http://" in phrase or "https://" in phrase or "www." in phrase:
+        return False
+    if "@" in phrase or ".com" in phrase or ".net" in phrase or ".org" in phrase:
+        return False
+
+    # 2. Много цифр или шаблон даты
+    digits = sum(ch.isdigit() for ch in phrase)
+    if digits >= 3:
+        return False
+    if re.search(r"\d{1,2}\s+\w+\s+\d{4}", phrase):
+        return False  # типичный "19 Mayo 2017"
+
+    # 3. Много шумовой пунктуации
+    if "!!!!" in phrase or "???" in phrase or "--" in phrase:
+        return False
+    if phrase.count("!") + phrase.count("?") >= 4:
+        return False
+
+    # 4. Заголовки КАПСОМ
+    if phrase.isupper():
+        return False
+
+    # 5. Слишком коротко по символам
+    if len(phrase) < 6:
+        return False
+
+    # 6. Полностью из "шумовых" служебных слов
+    noise_words = {"por", "se", "de", "y", "yo", "te", "la", "el", "al", "en", "lo", "que"}
+    if all(t.lower().strip("¡!¿?.,") in noise_words for t in tokens):
+        return False
+
+    # 7. Начало с ¡/¿ и без типичного глагола → скорее мусор
+    common_verbs = {
+        "es", "está", "estoy", "eres", "soy", "somos", "son",
+        "quiero", "quieres", "quiere", "quieren",
+        "tengo", "tienes", "tiene", "tenemos",
+        "puedo", "puedes", "puede", "podemos",
+        "vamos", "voy", "ven", "venga",
+        "dime", "di", "haz", "ve",
+        "mira", "pienso", "creo", "sabes", "sabe",
+        "habla", "hablo", "hable", "hablemos",
+        "déjame", "déjate",
+    }
+
+    def has_common_verb() -> bool:
+        for t in lower_tokens:
+            if t.strip("¡!¿?.,;:()[]{}\"'«»") in common_verbs:
+                return True
+        return False
+
+    if phrase.startswith(("¡", "¿")) and not has_common_verb():
+        return False
+
+    # 8. Проверка "похожести на испанский"
+    es_like_count = 0
+    es_total = 0
+    for t in tokens:
+        if any(c.isalpha() for c in t):
+            es_total += 1
+            if _es_like(t):
+                es_like_count += 1
+    if es_total > 0 and es_like_count / es_total < 0.5:
+        return False
+
+    return True
+
+
+    def has_common_verb() -> bool:
+        for t in lower_tokens:
+            if t.strip("¡!¿?.,;:()[]{}\"'«»") in common_verbs:
+                return True
+        return False
+
+    if phrase.startswith(("¡", "¿")) and not has_common_verb():
+        # что-то вроде "¡¡¡Naughty America", "¡Comparte!", "¡¡Error de acceso..."
+        return False
+
+    # 8. Проверка "похожести на испанский"
+    es_like_count = 0
+    es_total = 0
+    for t in tokens:
+        if any(c.isalpha() for c in t):
+            es_total += 1
+            if _es_like(t):
+                es_like_count += 1
+    if es_total > 0 and es_like_count / es_total < 0.5:
+        return False
+
+    return True
+
+
+# ==========================
 #   LLM
 # ==========================
 
@@ -74,6 +218,7 @@ SYSTEM_PROMPT = """
 - фраза выглядит завершённой или почти завершённой репликой
 - полезна в широком круге ситуаций, а не в одном конкретном фильме/истории
 - нормальный современный испанский (допустим лёгкий сленг)
+- ЕСЛИ ТЫ СОМНЕВАЕШЬСЯ, лучше ставь keep = true.
 
 КРИТЕРИИ "ПЛОХАЯ ФРАЗА" (keep = false):
 - обрывок середины предложения без контекста
@@ -96,7 +241,7 @@ SYSTEM_PROMPT = """
 def safe_parse_json(s: str):
     s = s.strip()
 
-    # отрезать всё до первой '[' (если модель что-то дописала до массива)
+    # отрезать всё до первой '['
     i = s.find("[")
     if i > 0:
         s = s[i:]
@@ -137,8 +282,8 @@ def call_llm(batch):
     возвращает dict[id] -> {"keep": bool, "reason": str}
 
     В случае JSON-ошибки:
-        - пытается восстановить частично
-        - если не получилось → делает индивидуальные LLM-запросы для каждой фразы
+      - пытается восстановить частично;
+      - если не получилось → делает индивидуальные LLM-запросы для каждой фразы.
     """
     user_payload = {"phrases": batch}
 
@@ -177,6 +322,13 @@ def call_llm(batch):
     # --- пробуем распарсить батч целиком ---
     try:
         arr = safe_parse_json(raw_content)
+
+        # LLM иногда отвечает одним объектом вместо массива — унифицируем в список
+        if isinstance(arr, dict):
+            arr = [arr]
+
+        if not isinstance(arr, list):
+            raise ValueError(f"unexpected JSON type: {type(arr)}")
     except Exception as e:
         print("[JSON ERROR] batch-level error:", e)
         print("[JSON ERROR] falling back to per-item evaluation…")
@@ -250,6 +402,8 @@ def main():
 
     mode = "a" if resume_from >= 0 and OUTPUT_INDEX.exists() else "w"
 
+    kept_total = 0  # сколько фраз в итоге приняли
+
     with PHRASE_INDEX.open("r", encoding="utf-8") as inp, \
             OUTPUT_INDEX.open(mode, encoding="utf-8") as out:
 
@@ -263,6 +417,10 @@ def main():
                 continue
 
             rec = json.loads(line)
+
+            if not simple_prefilter(rec):
+                continue
+
             phrase = rec["phrase"]
 
             local_id = len(batch_for_llm)
@@ -281,12 +439,9 @@ def main():
                     }
 
                 # редкий мониторинг качества
-                if (line_no // BATCH_SIZE) % 1 == 0:
+                if (line_no // BATCH_SIZE) % 500 == 0:
                     kept = sum(1 for d in decisions.values() if d["keep"])
-                    print(
-                        f"[info] batch #{line_no // BATCH_SIZE}: "
-                        f"kept {kept} of {len(batch_for_llm)}"
-                    )
+                    print(f"[info] batch #{line_no // BATCH_SIZE}: kept {kept} of {len(batch_for_llm)}")
 
                 for idx_in_batch, (ln, r) in enumerate(batch_records):
                     dec = decisions.get(idx_in_batch)
@@ -294,10 +449,7 @@ def main():
                         r["llm_keep"] = True
                         r["llm_reason"] = dec["reason"]
                         out.write(json.dumps(r, ensure_ascii=False) + "\n")
-                
-                # гарантируем запись на диск
-                out.flush()
-                os.fsync(out.fileno())
+                        kept_total += 1
 
                 if last_line_no >= 0:
                     save_checkpoint(last_line_no)
@@ -322,11 +474,13 @@ def main():
                     r["llm_keep"] = True
                     r["llm_reason"] = dec["reason"]
                     out.write(json.dumps(r, ensure_ascii=False) + "\n")
+                    kept_total += 1
 
             if last_line_no >= 0:
                 save_checkpoint(last_line_no)
 
     print("Filtered index written to:", OUTPUT_INDEX.resolve())
+    print("Total kept phrases:", kept_total)
 
 
 if __name__ == "__main__":
